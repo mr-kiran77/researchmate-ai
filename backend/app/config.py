@@ -37,10 +37,18 @@ class Settings(BaseSettings):
     pexels_api_key: str = ""
     pixabay_api_key: str = ""
 
-    # Storage
+    # Storage & Supabase
     database_path: str = "data/researchmate.db"
+    database_url: str = ""
+    supabase_url: str = ""
+    supabase_key: str = ""
     upload_dir: str = "data/uploads"
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
+
+    @property
+    def is_postgres(self) -> bool:
+        db_url = (self.database_url or "").strip().lower()
+        return db_url.startswith("postgresql://") or db_url.startswith("postgres://")
 
     @property
     def effective_gemini_key(self) -> str:
@@ -114,6 +122,8 @@ class Settings(BaseSettings):
                 else "Evidence-Grounded Extractive Synthesizer"
             ),
             "active_search_engines": search_engines,
+            "database_engine": "supabase_postgres" if self.is_postgres else "sqlite",
+            "supabase_configured": bool(self.is_postgres or (self.supabase_url and self.supabase_key)),
         }
 
 

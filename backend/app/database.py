@@ -1,17 +1,25 @@
-"""SQLite persistence layer for ResearchMate AI."""
+"""Persistence layer for ResearchMate AI supporting both Supabase PostgreSQL and local SQLite."""
 
 from __future__ import annotations
 
 import hashlib
 import hmac
 import json
+import logging
 import os
 import sqlite3
 import uuid
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Any, Iterator, Optional
+
+try:
+    import psycopg
+    from psycopg.rows import dict_row
+except ImportError:
+    psycopg = None
+    dict_row = None
 
 from app.config import get_settings
 from app.schemas import (
@@ -38,6 +46,87 @@ from app.schemas import (
     UserPreferences,
 )
 
+logger = logging.getLogger("researchmate.db")
+
+
+def _convert_placeholders_to_pg(query: str) -> str:
+    """Convert unquoted SQLite '?' placeholders to PostgreSQL '%s'."""
+    in_single = False
+    in_double = False
+    out = []
+    for ch in query:
+        if ch == "'" and not in_double:
+            in_single = not in_single
+            out.append(ch)
+        elif ch == '"' and not in_single:
+            in_double = not in_double
+            out.append(ch)
+        elif ch == '?' and not in_single and not in_double:
+            out.append('%s')
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+class PGCursorWrapper:
+    """Wraps a psycopg cursor for compatibility with sqlite3 row access."""
+
+    def __init__(self, cursor: Any) -> None:
+        self._cursor = cursor
+
+    def fetchone(self) -> Any:
+        return self._cursor.fetchone()
+
+    def fetchall(self) -> list[Any]:
+        return self._cursor.fetchall()
+
+    def fetchmany(self, size: Optional[int] = None) -> list[Any]:
+        return self._cursor.fetchmany(size) if size is not None else self._cursor.fetchmany()
+
+    @property
+    def rowcount(self) -> int:
+        return self._cursor.rowcount
+
+    def __iter__(self) -> Iterator[Any]:
+        return iter(self._cursor)
+
+
+class PGConnectionWrapper:
+    """Wraps psycopg connection to execute queries with SQLite-compatible method signatures."""
+
+    def __init__(self, conn: Any) -> None:
+        self._conn = conn
+
+    def execute(self, query: str, params: tuple | list | None = None) -> PGCursorWrapper:
+        converted = _convert_placeholders_to_pg(query)
+        if params is not None:
+            cur = self._conn.execute(converted, params)
+        else:
+            cur = self._conn.execute(converted)
+        return PGCursorWrapper(cur)
+
+    def executemany(self, query: str, seq_of_params: list | tuple) -> PGCursorWrapper:
+        converted = _convert_placeholders_to_pg(query)
+        cur = self._conn.cursor()
+        cur.executemany(converted, seq_of_params)
+        return PGCursorWrapper(cur)
+
+    def executescript(self, script: str) -> None:
+        cur = self._conn.cursor()
+        for statement in script.split(";"):
+            stmt = statement.strip()
+            if stmt:
+                cur.execute(stmt)
+
+    def commit(self) -> None:
+        self._conn.commit()
+
+    def rollback(self) -> None:
+        self._conn.rollback()
+
+    def close(self) -> None:
+        self._conn.close()
+
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -52,17 +141,39 @@ def _ensure_dirs() -> Path:
 
 
 @contextmanager
-def get_conn() -> Iterator[sqlite3.Connection]:
-    db_path = _ensure_dirs()
-    conn = sqlite3.connect(str(db_path), timeout=30.0, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    try:
-        conn.execute("PRAGMA journal_mode=WAL;")
-        conn.execute("PRAGMA foreign_keys=ON;")
-        yield conn
-        conn.commit()
-    finally:
-        conn.close()
+def get_conn() -> Iterator[Any]:
+    """Yield a database connection (Supabase PostgreSQL when DATABASE_URL is set, otherwise SQLite)."""
+    settings = get_settings()
+    if settings.is_postgres:
+        if not psycopg or not dict_row:
+            raise RuntimeError(
+                "DATABASE_URL is set for Supabase PostgreSQL, but 'psycopg' is not installed. "
+                "Install with 'pip install psycopg[binary]'."
+            )
+        conn_str = settings.database_url.strip()
+        if conn_str.startswith("postgres://"):
+            conn_str = "postgresql://" + conn_str[len("postgres://"):]
+        raw_conn = psycopg.connect(conn_str, row_factory=dict_row)
+        wrapper = PGConnectionWrapper(raw_conn)
+        try:
+            yield wrapper
+            wrapper.commit()
+        except Exception:
+            wrapper.rollback()
+            raise
+        finally:
+            wrapper.close()
+    else:
+        db_path = _ensure_dirs()
+        conn = sqlite3.connect(str(db_path), timeout=30.0, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        try:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA foreign_keys=ON;")
+            yield conn
+            conn.commit()
+        finally:
+            conn.close()
 
 
 SEED_KB_DOCS = [
@@ -164,159 +275,312 @@ SEED_KB_DOCS = [
 
 
 def init_db() -> None:
-    """Create tables and seed default preferences & knowledge base documents."""
+    """Create tables and seed default preferences & knowledge base documents.
+    Automatically initializes Supabase PostgreSQL when DATABASE_URL is set,
+    or local SQLite when running locally.
+    """
+    settings = get_settings()
     with get_conn() as conn:
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS research_reports (
-                id TEXT PRIMARY KEY,
-                question TEXT NOT NULL,
-                title TEXT NOT NULL,
-                audience TEXT NOT NULL DEFAULT 'academic',
-                depth TEXT NOT NULL DEFAULT 'standard',
-                status TEXT NOT NULL DEFAULT 'completed',
-                is_starred INTEGER NOT NULL DEFAULT 0,
-                llm_mode TEXT NOT NULL DEFAULT 'extractive_fallback',
-                source_count INTEGER NOT NULL DEFAULT 0,
-                conflict_count INTEGER NOT NULL DEFAULT 0,
-                plan_json TEXT NOT NULL,
-                report_json TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
+        if settings.is_postgres:
+            logger.info("Initializing Supabase PostgreSQL database tables...")
+            schema_file = Path(__file__).resolve().parent.parent / "supabase_schema.sql"
+            if not schema_file.exists():
+                schema_file = Path(__file__).resolve().parent.parent.parent / "supabase_schema.sql"
+            
+            if schema_file.exists():
+                schema_sql = schema_file.read_text(encoding="utf-8")
+                conn.executescript(schema_sql)
+            else:
+                conn.executescript(
+                    """
+                    CREATE TABLE IF NOT EXISTS users (
+                        id TEXT PRIMARY KEY,
+                        username TEXT NOT NULL UNIQUE,
+                        gmail TEXT NOT NULL UNIQUE,
+                        phone TEXT NOT NULL UNIQUE,
+                        country_code TEXT NOT NULL DEFAULT '+1',
+                        password_hash TEXT NOT NULL,
+                        created_at TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS user_profiles (
+                        user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+                        username TEXT NOT NULL,
+                        full_name TEXT NOT NULL,
+                        bio TEXT NOT NULL DEFAULT '',
+                        avatar_url TEXT NOT NULL DEFAULT '',
+                        followers_count INTEGER NOT NULL DEFAULT 0,
+                        following_count INTEGER NOT NULL DEFAULT 0,
+                        private_account INTEGER NOT NULL DEFAULT 0,
+                        notify_research_complete INTEGER NOT NULL DEFAULT 1,
+                        notify_conflicts INTEGER NOT NULL DEFAULT 1,
+                        two_factor_enabled INTEGER NOT NULL DEFAULT 0,
+                        updated_at TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS user_preferences (
+                        id INTEGER PRIMARY KEY CHECK (id = 1),
+                        default_audience TEXT NOT NULL DEFAULT 'academic',
+                        default_depth TEXT NOT NULL DEFAULT 'standard',
+                        enabled_sources_json TEXT NOT NULL DEFAULT '["web","academic_paper","uploaded_pdf","knowledge_base"]',
+                        citation_style TEXT NOT NULL DEFAULT 'numbered',
+                        updated_at TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS research_reports (
+                        id TEXT PRIMARY KEY,
+                        question TEXT NOT NULL,
+                        title TEXT NOT NULL,
+                        audience TEXT NOT NULL DEFAULT 'academic',
+                        depth TEXT NOT NULL DEFAULT 'standard',
+                        status TEXT NOT NULL DEFAULT 'completed',
+                        is_starred INTEGER NOT NULL DEFAULT 0,
+                        llm_mode TEXT NOT NULL DEFAULT 'extractive_fallback',
+                        source_count INTEGER NOT NULL DEFAULT 0,
+                        conflict_count INTEGER NOT NULL DEFAULT 0,
+                        plan_json TEXT NOT NULL,
+                        report_json TEXT NOT NULL,
+                        created_at TEXT NOT NULL,
+                        updated_at TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS chat_messages (
+                        id TEXT PRIMARY KEY,
+                        report_id TEXT NOT NULL REFERENCES research_reports(id) ON DELETE CASCADE,
+                        role TEXT NOT NULL,
+                        content TEXT NOT NULL,
+                        cited_source_ids_json TEXT NOT NULL DEFAULT '[]',
+                        interaction_id TEXT,
+                        created_at TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS uploaded_pdfs (
+                        id TEXT PRIMARY KEY,
+                        filename TEXT NOT NULL,
+                        file_path TEXT NOT NULL,
+                        title TEXT NOT NULL,
+                        author TEXT NOT NULL,
+                        page_count INTEGER NOT NULL,
+                        word_count INTEGER NOT NULL,
+                        full_text TEXT NOT NULL,
+                        pages_json TEXT NOT NULL,
+                        summary_json TEXT NOT NULL,
+                        created_at TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS knowledge_base_docs (
+                        id TEXT PRIMARY KEY,
+                        title TEXT NOT NULL,
+                        category TEXT NOT NULL,
+                        author_or_publisher TEXT NOT NULL,
+                        publication_date TEXT NOT NULL,
+                        content TEXT NOT NULL,
+                        tags_json TEXT NOT NULL,
+                        created_at TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS profile_posts (
+                        id TEXT PRIMARY KEY,
+                        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        title TEXT NOT NULL,
+                        caption TEXT NOT NULL,
+                        category TEXT NOT NULL DEFAULT 'Research Note',
+                        gradient TEXT NOT NULL,
+                        created_at TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS item_reactions (
+                        item_id TEXT PRIMARY KEY,
+                        likes_count INTEGER NOT NULL DEFAULT 0,
+                        is_liked INTEGER NOT NULL DEFAULT 0,
+                        is_saved INTEGER NOT NULL DEFAULT 0,
+                        updated_at TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS scheduled_content (
+                        id TEXT PRIMARY KEY,
+                        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        title TEXT NOT NULL,
+                        caption TEXT NOT NULL,
+                        category TEXT NOT NULL,
+                        scheduled_for TEXT NOT NULL,
+                        gradient TEXT NOT NULL,
+                        status TEXT NOT NULL DEFAULT 'queued',
+                        created_at TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS problem_reports (
+                        id TEXT PRIMARY KEY,
+                        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        description TEXT NOT NULL,
+                        screenshot_filename TEXT,
+                        screenshot_path TEXT,
+                        created_at TEXT NOT NULL
+                    );
+                    CREATE TABLE IF NOT EXISTS activity_daily_usage (
+                        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        usage_date TEXT NOT NULL,
+                        seconds_spent INTEGER NOT NULL DEFAULT 0,
+                        PRIMARY KEY (user_id, usage_date)
+                    );
+                    CREATE TABLE IF NOT EXISTS saved_images (
+                        id TEXT PRIMARY KEY,
+                        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                        image_key TEXT NOT NULL,
+                        topic TEXT NOT NULL,
+                        title TEXT NOT NULL,
+                        caption TEXT NOT NULL,
+                        image_url TEXT NOT NULL,
+                        thumbnail_url TEXT NOT NULL DEFAULT '',
+                        source_page_url TEXT NOT NULL DEFAULT '',
+                        photographer_or_source TEXT NOT NULL DEFAULT '',
+                        created_at TEXT NOT NULL,
+                        UNIQUE(user_id, image_key)
+                    );
+                    """
+                )
+        else:
+            conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS research_reports (
+                    id TEXT PRIMARY KEY,
+                    question TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    audience TEXT NOT NULL DEFAULT 'academic',
+                    depth TEXT NOT NULL DEFAULT 'standard',
+                    status TEXT NOT NULL DEFAULT 'completed',
+                    is_starred INTEGER NOT NULL DEFAULT 0,
+                    llm_mode TEXT NOT NULL DEFAULT 'extractive_fallback',
+                    source_count INTEGER NOT NULL DEFAULT 0,
+                    conflict_count INTEGER NOT NULL DEFAULT 0,
+                    plan_json TEXT NOT NULL,
+                    report_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
 
-            CREATE TABLE IF NOT EXISTS uploaded_pdfs (
-                id TEXT PRIMARY KEY,
-                filename TEXT NOT NULL,
-                file_path TEXT NOT NULL,
-                title TEXT NOT NULL,
-                author TEXT NOT NULL,
-                page_count INTEGER NOT NULL,
-                word_count INTEGER NOT NULL,
-                full_text TEXT NOT NULL,
-                pages_json TEXT NOT NULL,
-                summary_json TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
+                CREATE TABLE IF NOT EXISTS uploaded_pdfs (
+                    id TEXT PRIMARY KEY,
+                    filename TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    author TEXT NOT NULL,
+                    page_count INTEGER NOT NULL,
+                    word_count INTEGER NOT NULL,
+                    full_text TEXT NOT NULL,
+                    pages_json TEXT NOT NULL,
+                    summary_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
 
-            CREATE TABLE IF NOT EXISTS knowledge_base_docs (
-                id TEXT PRIMARY KEY,
-                title TEXT NOT NULL,
-                category TEXT NOT NULL,
-                author_or_publisher TEXT NOT NULL,
-                publication_date TEXT NOT NULL,
-                content TEXT NOT NULL,
-                tags_json TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
+                CREATE TABLE IF NOT EXISTS knowledge_base_docs (
+                    id TEXT PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    author_or_publisher TEXT NOT NULL,
+                    publication_date TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    tags_json TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
 
-            CREATE TABLE IF NOT EXISTS chat_messages (
-                id TEXT PRIMARY KEY,
-                report_id TEXT NOT NULL,
-                role TEXT NOT NULL,
-                content TEXT NOT NULL,
-                cited_source_ids_json TEXT NOT NULL DEFAULT '[]',
-                interaction_id TEXT,
-                created_at TEXT NOT NULL,
-                FOREIGN KEY (report_id) REFERENCES research_reports(id) ON DELETE CASCADE
-            );
+                CREATE TABLE IF NOT EXISTS chat_messages (
+                    id TEXT PRIMARY KEY,
+                    report_id TEXT NOT NULL,
+                    role TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    cited_source_ids_json TEXT NOT NULL DEFAULT '[]',
+                    interaction_id TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY (report_id) REFERENCES research_reports(id) ON DELETE CASCADE
+                );
 
-            CREATE TABLE IF NOT EXISTS user_preferences (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                default_audience TEXT NOT NULL DEFAULT 'academic',
-                default_depth TEXT NOT NULL DEFAULT 'standard',
-                enabled_sources_json TEXT NOT NULL DEFAULT '["web","academic_paper","uploaded_pdf","knowledge_base"]',
-                citation_style TEXT NOT NULL DEFAULT 'numbered',
-                updated_at TEXT NOT NULL
-            );
+                CREATE TABLE IF NOT EXISTS user_preferences (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    default_audience TEXT NOT NULL DEFAULT 'academic',
+                    default_depth TEXT NOT NULL DEFAULT 'standard',
+                    enabled_sources_json TEXT NOT NULL DEFAULT '["web","academic_paper","uploaded_pdf","knowledge_base"]',
+                    citation_style TEXT NOT NULL DEFAULT 'numbered',
+                    updated_at TEXT NOT NULL
+                );
 
-            CREATE TABLE IF NOT EXISTS users (
-                id TEXT PRIMARY KEY,
-                username TEXT NOT NULL UNIQUE,
-                gmail TEXT NOT NULL UNIQUE,
-                phone TEXT NOT NULL UNIQUE,
-                country_code TEXT NOT NULL DEFAULT '+1',
-                password_hash TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
+                CREATE TABLE IF NOT EXISTS users (
+                    id TEXT PRIMARY KEY,
+                    username TEXT NOT NULL UNIQUE,
+                    gmail TEXT NOT NULL UNIQUE,
+                    phone TEXT NOT NULL UNIQUE,
+                    country_code TEXT NOT NULL DEFAULT '+1',
+                    password_hash TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
 
-            CREATE TABLE IF NOT EXISTS user_profiles (
-                user_id TEXT PRIMARY KEY,
-                username TEXT NOT NULL,
-                full_name TEXT NOT NULL,
-                bio TEXT NOT NULL DEFAULT '',
-                avatar_url TEXT NOT NULL DEFAULT '',
-                followers_count INTEGER NOT NULL DEFAULT 0,
-                following_count INTEGER NOT NULL DEFAULT 0,
-                private_account INTEGER NOT NULL DEFAULT 0,
-                notify_research_complete INTEGER NOT NULL DEFAULT 1,
-                notify_conflicts INTEGER NOT NULL DEFAULT 1,
-                two_factor_enabled INTEGER NOT NULL DEFAULT 0,
-                updated_at TEXT NOT NULL
-            );
+                CREATE TABLE IF NOT EXISTS user_profiles (
+                    user_id TEXT PRIMARY KEY,
+                    username TEXT NOT NULL,
+                    full_name TEXT NOT NULL,
+                    bio TEXT NOT NULL DEFAULT '',
+                    avatar_url TEXT NOT NULL DEFAULT '',
+                    followers_count INTEGER NOT NULL DEFAULT 0,
+                    following_count INTEGER NOT NULL DEFAULT 0,
+                    private_account INTEGER NOT NULL DEFAULT 0,
+                    notify_research_complete INTEGER NOT NULL DEFAULT 1,
+                    notify_conflicts INTEGER NOT NULL DEFAULT 1,
+                    two_factor_enabled INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL
+                );
 
-            CREATE TABLE IF NOT EXISTS profile_posts (
-                id TEXT PRIMARY KEY,
-                user_id TEXT NOT NULL,
-                title TEXT NOT NULL,
-                caption TEXT NOT NULL,
-                category TEXT NOT NULL DEFAULT 'Research Note',
-                gradient TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            );
+                CREATE TABLE IF NOT EXISTS profile_posts (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    caption TEXT NOT NULL,
+                    category TEXT NOT NULL DEFAULT 'Research Note',
+                    gradient TEXT NOT NULL,
+                    created_at TEXT NOT NULL
+                );
 
-            CREATE TABLE IF NOT EXISTS item_reactions (
-                item_id TEXT PRIMARY KEY,
-                likes_count INTEGER NOT NULL DEFAULT 0,
-                is_liked INTEGER NOT NULL DEFAULT 0,
-                is_saved INTEGER NOT NULL DEFAULT 0,
-                updated_at TEXT NOT NULL
-            );
+                CREATE TABLE IF NOT EXISTS item_reactions (
+                    item_id TEXT PRIMARY KEY,
+                    likes_count INTEGER NOT NULL DEFAULT 0,
+                    is_liked INTEGER NOT NULL DEFAULT 0,
+                    is_saved INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL
+                );
 
-            CREATE TABLE IF NOT EXISTS scheduled_content (
-                id TEXT PRIMARY KEY,
-                user_id TEXT NOT NULL,
-                title TEXT NOT NULL,
-                caption TEXT NOT NULL,
-                category TEXT NOT NULL,
-                scheduled_for TEXT NOT NULL,
-                gradient TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'queued',
-                created_at TEXT NOT NULL
-            );
+                CREATE TABLE IF NOT EXISTS scheduled_content (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    caption TEXT NOT NULL,
+                    category TEXT NOT NULL,
+                    scheduled_for TEXT NOT NULL,
+                    gradient TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    created_at TEXT NOT NULL
+                );
 
-            CREATE TABLE IF NOT EXISTS problem_reports (
-                id TEXT PRIMARY KEY,
-                user_id TEXT NOT NULL,
-                description TEXT NOT NULL,
-                screenshot_filename TEXT,
-                screenshot_path TEXT,
-                created_at TEXT NOT NULL
-            );
+                CREATE TABLE IF NOT EXISTS problem_reports (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    screenshot_filename TEXT,
+                    screenshot_path TEXT,
+                    created_at TEXT NOT NULL
+                );
 
-            CREATE TABLE IF NOT EXISTS activity_daily_usage (
-                user_id TEXT NOT NULL,
-                usage_date TEXT NOT NULL,
-                seconds_spent INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (user_id, usage_date)
-            );
+                CREATE TABLE IF NOT EXISTS activity_daily_usage (
+                    user_id TEXT NOT NULL,
+                    usage_date TEXT NOT NULL,
+                    seconds_spent INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (user_id, usage_date)
+                );
 
-            CREATE TABLE IF NOT EXISTS saved_images (
-                id TEXT PRIMARY KEY,
-                user_id TEXT NOT NULL,
-                image_key TEXT NOT NULL,
-                topic TEXT NOT NULL,
-                title TEXT NOT NULL,
-                caption TEXT NOT NULL,
-                image_url TEXT NOT NULL,
-                thumbnail_url TEXT NOT NULL DEFAULT '',
-                source_page_url TEXT NOT NULL DEFAULT '',
-                photographer_or_source TEXT NOT NULL DEFAULT '',
-                created_at TEXT NOT NULL,
-                UNIQUE(user_id, image_key)
-            );
-            """
-        )
+                CREATE TABLE IF NOT EXISTS saved_images (
+                    id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    image_key TEXT NOT NULL,
+                    topic TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    caption TEXT NOT NULL,
+                    image_url TEXT NOT NULL,
+                    thumbnail_url TEXT NOT NULL DEFAULT '',
+                    source_page_url TEXT NOT NULL DEFAULT '',
+                    photographer_or_source TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    UNIQUE(user_id, image_key)
+                );
+                """
+            )
 
         # Ensure default preferences row
         pref_exists = conn.execute("SELECT 1 FROM user_preferences WHERE id = 1").fetchone()
